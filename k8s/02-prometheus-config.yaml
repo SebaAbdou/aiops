@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: aiops
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+      external_labels:
+        cluster: 'docker-desktop'
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      - job_name: 'echo-server'
+        static_configs:
+          - targets: ['echo-server:5000']
+
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['prometheus:9090']
+
+      - job_name: 'node-exporter'
+        static_configs:
+          - targets: ['node-exporter:9100']
+
+      - job_name: 'aiops-engine'
+        static_configs:
+          - targets: ['aiops-engine:8000']
+
+      - job_name: 'kubelet'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics
+
+      - job_name: 'kubelet-cadviser'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+      - job_name: 'kubernetes-nodes'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+
+      - job_name: 'kubernetes-pods'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - aiops
+
+  rules.yml: |
+    groups:
+      - name: aiops.anomaly
+        interval: 30s
+        rules:
+          - alert: AnomalyRateTooHigh
+            expr: aiops_anomaly_rate_1m > 0.30
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High anomaly rate detected"
+              description: "Rolling anomaly rate is {{ $value | humanizePercentage }} (threshold 30%) for 2+ minutes."
+
+          - alert: AnomalyRateCritical
+            expr: aiops_anomaly_rate_1m > 0.60
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Critical anomaly rate"
+              description: "Rolling anomaly rate is {{ $value | humanizePercentage }} (threshold 60%)."
+
+          - alert: PipelineStalled
+            expr: increase(aiops_prediction_total[2m]) == 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "AIOps pipeline has stalled"
+              description: "No predictions in the last 2 minutes. Pipeline may be crashed."
+
+          - alert: HighFeatureDrift
+            expr: aiops_feature_drift_score > 3.0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High feature drift detected"
+              description: "Feature drift score is {{ $value | humanize }} (z-score >3). Model may need retraining."
+
+          - alert: HighErrorRate
+            expr: rate(http_requests_total{status=~"5.."}[2m]) / rate(http_requests_total[2m]) > 0.10
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High HTTP error rate on echo-server"
+              description: "Error rate is {{ $value | humanizePercentage }} (threshold 10%)."
