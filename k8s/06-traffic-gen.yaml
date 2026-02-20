@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-gen
+  namespace: aiops
+  labels:
+    app: traffic-gen
+    tier: load-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-gen
+  template:
+    metadata:
+      labels:
+        app: traffic-gen
+        tier: load-generator
+    spec:
+      containers:
+        - name: locust
+          image: aiops/traffic-gen:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8089
+              name: http
+          env:
+            - name: LOCUST_HOST
+              value: "http://echo-server:5000"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+      # Wait for echo-server to be ready before starting
+      initContainers:
+        - name: wait-for-echo-server
+          image: busybox:latest
+          command:
+            [
+              "sh",
+              "-c",
+              'until nc -z echo-server 5000; do echo "Waiting for echo-server..."; sleep 2; done',
+            ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-gen
+  namespace: aiops
+  labels:
+    app: traffic-gen
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8089
+      targetPort: 8089
+      name: http
+  selector:
+    app: traffic-gen
