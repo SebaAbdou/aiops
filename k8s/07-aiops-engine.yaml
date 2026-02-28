@@ -1,0 +1,315 @@
+# aiops-engine deployment
+#
+# this is the brain of the platform. it runs pipeline.py which:
+#   1. queries prometheus every 5 seconds for metrics
+#   2. builds a 12-sample sliding window (60 seconds of history)
+#   3. extracts 96 statistical features from the window
+#   4. scores the features with the trained randomforest model
+#   5. exports anomaly predictions back to prometheus (for grafana)
+#   6. saves all windows to /data/cleaned_dataset.csv for retraining
+#
+# deployment lifecycle:
+#   - you run: docker build -t aiops/aiops-engine:latest ./aiops-engine/
+#   - model (anomaly_detector.pkl) is baked into the image at build time
+#   - kubectl apply or rollout restart launches this yaml
+#   - kubernetes pulls the image from local docker desktop cache (imagePullPolicy: Never)
+#   - pipeline.py starts and loads /app/models/anomaly_detector.pkl
+
+apiVersion: apps/v1
+# apps/v1 = stable api group for workloads (deployments, statefulsets, daemonsets).
+# as opposed to just v1 which is for simpler objects like pods, services, configmaps.
+
+kind: Deployment
+# deployment = manages a set of identical pods.
+# if the pod crashes, the deployment controller automatically restarts it.
+# if you set replicas: 2, it always keeps exactly 2 pods running.
+# this is what gives kubernetes self-healing behavior.
+
+metadata:
+  name: aiops-engine
+  # name of the deployment object in kubernetes. used by:
+  #   kubectl rollout restart deployment/aiops-engine
+  #   kubectl logs deployment/aiops-engine
+  #   kubectl describe deployment/aiops-engine
+
+  namespace: aiops
+  # which namespace this belongs to.
+  # we created namespace 'aiops' in 01-namespace.yaml.
+  # all aiops resources live here, isolated from kube-system and default.
+  # why namespace? isolation: limits blast radius if something goes wrong.
+
+  labels:
+    app: aiops-engine
+    tier: analytics
+    # labels are key-value tags attached to objects.
+    # used for:
+    #   grouping:   kubectl get pods -l app=aiops-engine
+    #   selecting:  services use labels to find their pods
+    #   organizing: tier=analytics vs tier=load-generator
+spec:
+  # spec = desired state. kubernetes continuously reconciles actual state to match this.
+
+  replicas: 1
+  # how many identical pods to run.
+  # 1 = single instance (no redundancy, fine for lab/dev).
+  # in production: replicas: 2 for high availability (one pod can crash without downtime).
+
+  selector:
+    matchLabels:
+      app: aiops-engine
+  # selector = how the deployment finds and manages its pods.
+  # kubernetes looks for pods with label app=aiops-engine.
+  # must match the labels in template.metadata.labels below.
+  # this is the link between the deployment controller and the pods it owns.
+
+  template:
+    # template = blueprint for every pod this deployment creates.
+    # every pod looks exactly like this.
+
+    metadata:
+      labels:
+        app: aiops-engine
+        tier: analytics
+        # labels applied to every pod created by this deployment.
+        # must include app=aiops-engine so the selector above finds it.
+
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        # annotations = metadata used by external tools, not kubernetes itself.
+        # these three tell prometheus to scrape this pod automatically.
+        #
+        # how it works:
+        # prometheus has kubernetes service discovery — it watches all pods in the cluster.
+        # when it finds a pod with prometheus.io/scrape=true, it adds it as a scrape target.
+        # it then calls GET http://<pod-ip>:8000/metrics every 5 seconds.
+        # pipeline.py exposes anomaly metrics there: anomaly_score, anomaly_type, etc.
+        # grafana reads those metrics to power the 'anomaly intelligence' dashboard panels.
+    spec:
+      containers:
+        - name: aiops-engine
+          # name of the container inside the pod.
+          # a pod can have multiple containers (called sidecars), but we have one here.
+          # used in: kubectl logs -n aiops deployment/aiops-engine
+
+          image: aiops-engine:latest
+          # which docker image to run. format: <registry>/<name>:<tag>
+          # no registry prefix = docker hub convention, but we never pull from there.
+          # you build this locally: docker build -t aiops/aiops-engine:latest ./aiops-engine/
+          # the image contains: pipeline.py + anomaly_detector.pkl + scaler.pkl + feature_list.json
+          # model is baked in at build time via: Dockerfile COPY models/ /app/models/
+
+          imagePullPolicy: Never
+          # critical for local development!
+          # Never = only use locally built image. never go to docker hub or any registry.
+          # if local image not found → pod crashes with ErrImageNeverPull error.
+          # this means: you MUST run docker build before every kubectl apply/rollout restart.
+          #
+          # why not Always? Always would pull from docker hub on every restart.
+          # our image doesn't exist on docker hub (it's local only), so Always would fail.
+
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus:9090"
+            # tells pipeline.py where to query metrics from.
+            # 'prometheus' is the kubernetes service name (defined in 04-prometheus.yaml).
+            # kubernetes dns automatically resolves 'prometheus' → cluster IP of that service.
+            # pipeline.py reads: os.getenv('PROMETHEUS_URL', 'http://prometheus:9090')
+
+            - name: MODELS_DIR
+              value: "/aiops-engine/models"
+            # where inside the container the trained model files live:
+            #   /aiops-engine/models/anomaly_detector.pkl   (randomforest classifier)
+            #   /aiops-engine/models/scaler.pkl              (standardscaler for feature normalization)
+            #   /aiops-engine/models/feature_list.json       (names of the 96 features)
+            # these were copied in during docker build: COPY models/ /aiops-engine/models/
+            # to retrain: rebuild image with new model files, then rollout restart.
+
+            - name: METRICS_PORT
+              value: "8000"
+            # port where pipeline.py's prometheus metrics server listens.
+            # pipeline exposes anomaly scores, types, window counts here.
+            # must match containerPort below and the prometheus.io/port annotation above.
+
+          ports:
+            - containerPort: 8000
+              name: metrics
+            # document which port the container listens on (for kubernetes tooling).
+            # this doesn't open or restrict the port — containers inside the cluster
+            # are always reachable. this is metadata used by probes and services.
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: shared
+              mountPath: /shared
+            # mount the 'data' volume (defined below) at /data inside the container.
+            # pipeline.py writes: /data/cleaned_dataset.csv every 5 collected windows.
+            # why a volume? if the pod crashes and restarts, /data/ is NOT wiped.
+            # without this volume, every restart = all collected data is lost.
+            # with PVC-backed volume: data survives pod restarts and deletions.
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            # requests = minimum guaranteed resources kubernetes reserves for this pod.
+            # kubernetes scheduler uses requests to decide which node can host the pod.
+            # 512Mi: enough for pandas + sklearn model loaded in memory (~250MB peak).
+            # 200m: 0.2 cpu cores. pipeline is mostly i/o-bound (waiting for prometheus),
+            # not cpu-bound, so 0.2 cores is enough.
+
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+            # limits = hard ceiling. exceeding this → kubernetes kills/throttles.
+            # 2Gi RAM: safety net if dataset grows large (335 rows x 96 features = ~250MB).
+            # 1000m: 1 full cpu core maximum. prevents this pod starving others.
+            # if pod exceeds memory limit → OOMKilled (out of memory, pod restarted).
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 30
+          # startupProbe = verifies the container has STARTED successfully.
+          # kubernetes holds off liveness checks until startup passes.
+          #
+          # timeline:
+          #   t=0:   pod starts, python interpreter launches
+          #   t=15s: kubernetes begins checking GET http://pod:8000/metrics
+          #   t=15s-315s: checks every 10s, allows up to 30 failures
+          #   if all 30 fail (5 min timeout): kubernetes restarts the pod
+          #   if any check passes: startup complete, liveness probe takes over
+          #
+          # why failureThreshold: 30? (300 seconds = 5 min)
+          # pipeline.py takes time to initialize: connect prometheus, fill 12-sample window.
+          # the sliding window needs 12 x 5s = 60 seconds of data before first real window.
+          # we give it up to 5 minutes before giving up and restarting.
+
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 3
+          # livenessProbe = checks if container is STILL ALIVE during normal operation.
+          # runs every 30 seconds forever (after startup probe passes).
+          # if it fails 3 times in a row (90 seconds) → kubernetes restarts the pod.
+          #
+          # catches: hung pipeline, deadlock, unhandled exception that blocks the server.
+          # real scenario: if prometheus goes down and pipeline blocks on queries,
+          # liveness probe detects the hang after 90s and automatically restarts the pod.
+      initContainers:
+        # init containers run and complete BEFORE the main container starts.
+        # they run sequentially (one at a time). if one fails, kubernetes retries it.
+        # purpose: ensure all dependencies are ready before pipeline.py launches.
+        # this prevents startup race conditions (e.g. pipeline starting before prometheus).
+        #
+        # execution order:
+        #   1. wait-for-prometheus  (exits when prometheus is healthy)
+        #   2. wait-for-echo-server (exits when echo-server port is open)
+        #   3. wait-for-traffic-gen (sleeps 60s for traffic to stabilize)
+        #   4. [main container starts] pipeline.py launches
+
+        - name: wait-for-prometheus
+          image: busybox:latest
+          # busybox = tiny linux image (~1MB) with wget/nc/sh utilities.
+          # much lighter than python:3.11 (~200MB) for simple shell commands.
+          command:
+            - sh
+            - -c
+            - 'until wget -q -O- http://prometheus:9090/-/healthy; do echo "Waiting for Prometheus..."; sleep 2; done'
+          # loops every 2 seconds until prometheus responds to /-/healthy.
+          # why? pipeline.py calls prometheus immediately on startup.
+          # if prometheus isn't ready → query fails → pipeline crashes.
+          # this init container blocks until prometheus confirms it's ready.
+
+        - name: wait-for-echo-server
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - 'until nc -z echo-server 5000; do echo "Waiting for echo-server..."; sleep 2; done'
+          # nc -z = netcat zero-mode: just check if port 5000 is open, don't send data.
+          # loops until echo-server is accepting TCP connections.
+          # why? if echo-server isn't running, there are no http request metrics in prometheus.
+          # pipeline would scrape empty metrics → produce zero-value windows → bad training data.
+
+        - name: wait-for-traffic-gen
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - 'echo "Waiting 60s for traffic-gen to stabilize..."; sleep 60; echo "Ready to start pipeline"'
+          # sleep 60 seconds to let traffic-gen fully ramp up.
+          # unlike prometheus and echo-server, locust doesn't expose a health endpoint.
+          # so we use a fixed 60s wait (enough for locust warm-up phase 1 to complete).
+          # why 60s? locust phase 1 = warm-up = 60 seconds. after that, traffic is stable.
+          # without this wait: pipeline starts before any requests are sent,
+          # captures empty/zero metrics in first windows → corrupt training data.
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pipeline-data
+        - name: shared
+          persistentVolumeClaim:
+            claimName: aiops-shared
+        # volumes = storage attached to this pod.
+        # 'data' volume is backed by the PersistentVolumeClaim named 'pipeline-data'.
+        # the PVC was created in 03-pvc.yaml and allocates 1Gi of storage.
+        #
+        # why PVC?
+        #   pod crashes and restarts → /data/cleaned_dataset.csv is still there!
+        #   pod deleted and recreated → PVC reattaches, all collected windows preserved.
+        #   without PVC: every restart = /data/ is empty = lose all collected training data.
+        #
+        # this volume is mounted at /data inside the container (see volumeMounts above).
+        # pipeline.py writes incrementally: saves every 5 new windows to /data/cleaned_dataset.csv.
+        # you extract this file for retraining: kubectl exec ... cat /data/cleaned_dataset.csv
+
+---
+# service for aiops-engine
+#
+# a service gives pods a stable dns name and virtual IP inside the cluster.
+# without a service, other pods must know the exact pod IP — which changes on every restart.
+# with a service: other pods always use http://aiops-engine:8000 regardless of pod restarts.
+#
+# in this case, the primary consumer is prometheus:
+# prometheus scrapes http://aiops-engine:8000/metrics for anomaly metrics.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-engine
+  # dns name inside the cluster: aiops-engine
+  # full qualified: aiops-engine.aiops.svc.cluster.local
+  # other pods in same namespace just use: http://aiops-engine:8000
+
+  namespace: aiops
+  labels:
+    app: aiops-engine
+spec:
+  selector:
+    app: aiops-engine
+  # finds pods with label app=aiops-engine and routes traffic to them.
+  # if pod restarts and gets a new IP, selector still finds it by label.
+  # this is how the service stays stable even as pods come and go.
+
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+    # port: 8000        = port the SERVICE listens on (what callers use)
+    # targetPort: 8000  = port on the POD to forward traffic to
+    # net effect: http://aiops-engine:8000/metrics → pod's port 8000 /metrics
+    # prometheus uses this url to scrape aiops-engine anomaly metrics.
+
+  type: ClusterIP
+  # clusterip = internal-only. accessible from inside the cluster only.
+  # not exposed to your local machine or the internet.
+  # only prometheus (also inside cluster) needs to talk to aiops-engine,
+  # so clusterip is correct. no need for nodeport or loadbalancer here.
