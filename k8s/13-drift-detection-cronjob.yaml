@@ -1,0 +1,123 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aiops-drift-detection
+  namespace: aiops
+  labels:
+    app: aiops
+    component: drift-detection
+spec:
+  # Every 5 minutes: continuously monitor for drift
+  schedule: "*/5 * * * *"
+
+  # Keep last 3 successful and 1 failed job for debugging
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+  concurrencyPolicy: Forbid # Don't run concurrent jobs
+  startingDeadlineSeconds: 10
+
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300 # Kill if running > 5 min
+
+      template:
+        metadata:
+          name: aiops-drift-detection
+          labels:
+            app: aiops
+            job: drift-detection
+
+        spec:
+          serviceAccountName: aiops-worker # Needs kubectl access to create jobs
+
+          containers:
+            - name: drift-detector
+              image: aiops-engine:latest
+              imagePullPolicy: IfNotPresent
+
+              command:
+                - python
+                - /aiops-engine/detect_and_trigger_retrain.py
+
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "500m"
+
+              # Mount shared data volumes
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                - name: shared
+                  mountPath: /shared
+
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: LOG_LEVEL
+                  value: "INFO"
+                - name: MIN_HOURS_BETWEEN_RETRAIN
+                  value: "0"
+                - name: MIN_SAMPLES_FOR_RETRAIN
+                  value: "200"
+                - name: DRIFT_THRESHOLD
+                  value: "0.80"
+
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: pipeline-data
+            - name: shared
+              persistentVolumeClaim:
+                claimName: aiops-shared
+
+          restartPolicy: Never
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiops-worker
+  namespace: aiops
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aiops-worker
+rules:
+  # Allow creating jobs (for triggering retraining)
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch"]
+  # Allow creating jobs from cronjobs
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list"]
+  # Allow reading pod logs
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+  # Allow updating status
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
+    verbs: ["get", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aiops-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aiops-worker
+subjects:
+  - kind: ServiceAccount
+    name: aiops-worker
+    namespace: aiops

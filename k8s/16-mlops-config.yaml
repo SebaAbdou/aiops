@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aiops-shared
+  namespace: aiops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: hostpath
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlops-config
+  namespace: aiops
+data:
+  # Configuration for MLOps pipeline
+  drift_threshold: "0.80"
+  variance_threshold: "0.02"
+  min_samples_for_retrain: "200"
+  optimal_samples: "400"
+  min_hours_between_retrain: "24"
+  drift_check_interval_minutes: "5"
+
+  # Status tracking paths
+  status_file: "/shared/mlops_status.json"
+  metrics_file: "/shared/mlops_metrics.txt"
+
+  # Model paths
+  model_path: "/aiops-engine/models/model.pkl"
+  data_path: "/data/live_dataset_latest.csv"
+  training_data_path: "/data/training_dataset_fresh.csv"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-mlops-targets
+  namespace: aiops
+data:
+  mlops-targets.yaml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+    - job_name: 'aiops-mlops'
+      static_configs:
+      - targets: ['localhost:9090']
+      
+      # Scrape mlops_metrics.txt file every 10 seconds
+      metrics_path: '/shared/mlops_metrics.txt'
