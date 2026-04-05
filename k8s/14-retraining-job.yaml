@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aiops-retrain # Will be suffixed with timestamp when created
+  namespace: aiops
+  labels:
+    app: aiops
+    component: retraining
+    version: "1.0"
+spec:
+  # Run to completion, don't retry (data might have changed)
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600 # Kill if running > 1 hour
+  ttlSecondsAfterFinished: 86400 # Clean up finished job after 1 day
+
+  template:
+    metadata:
+      name: aiops-retrain-pod
+      labels:
+        app: aiops
+        job: retraining
+
+    spec:
+      serviceAccountName: aiops-worker
+
+      containers:
+        - name: retrain-engine
+          image: aiops-engine:latest
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - python
+            - /aiops-engine/auto_retrain_pipeline.py
+
+          # Generous resources for training
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "2"
+            limits:
+              memory: "2Gi"
+              cpu: "4"
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: shared
+              mountPath: /shared
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: LOG_LEVEL
+              value: "DEBUG"
+
+          # Capture logs for Grafana
+          securityContext:
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pipeline-data
+        - name: shared
+          persistentVolumeClaim:
+            claimName: aiops-shared
+
+      # Don't restart on failure - let it complete once
+      restartPolicy: Never
+
+      # Node affinity: prefer high-resource nodes for training
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["worker-1", "worker-2"] # Adjust to your worker nodes
+
+---
+# Deployment to expose model metrics and status
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-metrics
+  namespace: aiops
+spec:
+  selector:
+    app: aiops
+  ports:
+    - name: prometheus
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
