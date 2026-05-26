@@ -30,14 +30,15 @@
 2. [System Architecture](#-system-architecture)
 3. [Tech Stack](#-tech-stack)
 4. [Key Features](#-key-features)
-5. [Quick Start](#-quick-start)
-6. [Project Structure](#-project-structure)
-7. [Drift Detection & Auto-Retraining](#-drift-detection--auto-retraining)
-8. [Feature Engineering (96 Dimensions)](#-feature-engineering-96-dimensions)
-9. [Monitoring & Verification](#-monitoring--verification)
-10. [Useful Commands](#-useful-commands)
-11. [Problems Encountered & Solutions](#-problems-encountered--solutions)
-12. [Author](#-author)
+5. [Platform in Action](#-platform-in-action)
+6. [Quick Start](#-quick-start)
+7. [Project Structure](#-project-structure)
+8. [Drift Detection & Auto-Retraining](#-drift-detection--auto-retraining)
+9. [Feature Engineering (96 Dimensions)](#-feature-engineering-96-dimensions)
+10. [Monitoring & Verification](#-monitoring--verification)
+11. [Useful Commands](#-useful-commands)
+12. [Problems Encountered & Solutions](#-problems-encountered--solutions)
+13. [Author](#-author)
 
 ---
 
@@ -169,6 +170,42 @@ A newly trained model is **automatically rejected** if `ROC-AUC_new < ROC-AUC_pr
 - **Prometheus**: 40+ metric types scraped every 5 s, PromQL alert rules with configurable thresholds
 - **Grafana**: real-time visualisation of anomaly scores, types, root-cause features, and MLOps pipeline state
 - **Audit trail**: `/shared/mlops_status.json` records every drift check, retraining attempt, and rollback decision
+
+---
+
+## 🖥️ Platform in Action
+
+Four Grafana dashboard screenshots captured during a live run of the 7-phase fault-injection cycle.
+
+### Application Metrics & Anomaly Scoring
+
+<img src="assets/dashboard-http-metrics.png" alt="HTTP request rate, echo server modes, anomaly rate and raw anomaly score" width="100%"/>
+
+HTTP request rate spikes during DDoS phases, p95/p99 latency peaks sharply during slow-client injection, and the rolling anomaly rate tracks the fault cycle in real time. The **Echo Server Mode** panel (bottom-right) confirms which fault mode is currently active, here `cpu = 1`, all others at 0. The Raw Anomaly Score panel shows the RandomForest probability hovering around 0.55–0.65 during the transition.
+
+---
+
+### Real-Time Anomaly Intelligence : CPU Stress Detected
+
+<img src="assets/dashboard-cpu-stress.png" alt="CPU Stress anomaly type with root cause features and system load spike" width="100%"/>
+
+The **Last Anomaly Type** panel switches to **CPU Stress** (displayed in red) as the cpu-spike phase begins. The **Root Cause Features** heatmap highlights the top-3 contributing metrics, all system load averages (1m/5m max, mean, p95), confirming correct root cause attribution. The **System Load Average** chart shows the characteristic spike to ~25, and CPU usage climbs steadily to 75%+.
+
+---
+
+### System Observability : Drift Score & Prediction Counters
+
+<img src="assets/dashboard-drift-predictions.png" alt="Feature drift score z-score, total predictions 2125, total anomalies 1365, CPU and network" width="100%"/>
+
+The **Feature Drift Score** (z-score) chart tracks distributional shift across the 96-feature space in real time. At this point the platform has processed **2,125 predictions** and flagged **1,365 anomalies** since startup. Node CPU usage, memory available, network throughput, and system load panels provide full host-level infrastructure context alongside the ML metrics.
+
+---
+
+### MLOps Health : Model Status & Retraining Pipeline
+
+<img src="assets/dashboard-mlops-status.png" alt="MLOps panel: ROC-AUC 85.9%, Retraining Status Idle, 3785 training samples" width="100%"/>
+
+**Model Health Status** at **85.9% ROC-AUC**, above the 0.80 drift threshold, so no retraining is triggered. **Retraining Status** is `Idle`. **Training Data Available** shows 3,785 samples currently collected on the PVC. The **Anomaly Type Over Time** bar chart confirms the classifier correctly cycles through all fault types across multiple consecutive 540-second cycles. The **Model Accuracy** panel shows the classification accuracy trend over the last 30 minutes.
 
 ---
 
